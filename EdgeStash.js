@@ -994,7 +994,7 @@ const LOGIN_PAGE = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8
 <div id="app" class="auth-wrap min-h-screen bg-slate-50 px-6 py-6 dark:bg-slate-950" v-cloak>
   <el-button class="theme-float" circle style="position:fixed;right:18px;top:18px;" @click="toggleTheme"><iconify-icon :icon="isDark ? 'solar:sun-2-bold-duotone' : 'solar:moon-bold-duotone'"></iconify-icon></el-button>
   <div class="surface auth-card shadow-xl transition-colors duration-300">
-    <div class="auth-head"><img class="auth-logo" src="${APP_LOGO_SRC}" alt="EdgeStash Logo"><div class="auth-title">EdgeStash</div><div class="muted" style="margin-top:6px;">私有边缘存储</div></div>
+    <div class="auth-head flex flex-col items-center text-center"><img class="auth-logo" src="${APP_LOGO_SRC}" alt="EdgeStash Logo"><div class="auth-title">EdgeStash</div><div class="muted" style="margin-top:6px;">私有边缘存储</div></div>
     <el-tabs v-model="mode" stretch><el-tab-pane label="管理员" name="admin"></el-tab-pane><el-tab-pane label="授权用户" name="user"></el-tab-pane></el-tabs>
     <el-form @submit.prevent="handleLogin" label-position="top">
       <el-form-item v-if="mode === 'user'" label="邮箱"><el-input v-model="form.email" size="large" autocomplete="username" placeholder="name@example.com"></el-input></el-form-item>
