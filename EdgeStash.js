@@ -842,7 +842,7 @@ const APP_LOGO_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAJAAAAC
 const APP_LOGO_SRC = '/logo.png';
 const ASSET_CDN_BASE_URL = 'https://s4.zstatic.net/ajax/libs';
 const NPM_CDN_BASE_URL = 'https://s4.zstatic.net/npm';
-const MATERIAL_ICON_BASE_URL = 'https://npm.onmicrosoft.cn/material-icon-theme@5.35.0/icons/';
+const MATERIAL_ICON_BASE_URL = 'https://cdn.jsdelivr.net/npm/material-icon-theme@5.35.0/icons/';
 
 function imageDataUrlResponse(dataUrl) {
   const [meta, base64] = dataUrl.split(',');
@@ -997,8 +997,8 @@ const LOGIN_PAGE = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8
     <el-tabs v-model="mode" stretch><el-tab-pane label="管理员" name="admin"></el-tab-pane><el-tab-pane label="授权用户" name="user"></el-tab-pane></el-tabs>
     <el-form @submit.prevent="handleLogin" label-position="top">
       <el-form-item v-if="mode === 'user'" label="邮箱"><el-input v-model="form.email" size="large" autocomplete="username" placeholder="name@example.com"></el-input></el-form-item>
-      <el-form-item label="密码"><el-input v-model="form.password" size="large" type="password" show-password autocomplete="current-password" placeholder="请输入密码" @keyup.enter="handleLogin"></el-input></el-form-item>
-      <el-button type="primary" size="large" style="width:100%;" :loading="loading" @click="handleLogin"><iconify-icon icon="solar:login-3-bold-duotone"></iconify-icon>登录</el-button>
+      <el-form-item label="密码"><el-input v-model="form.password" size="large" type="password" show-password autocomplete="current-password" placeholder="请输入密码"></el-input></el-form-item>
+      <el-button type="primary" size="large" style="width:100%;" :loading="loading"  native-type="submit"><iconify-icon icon="solar:login-3-bold-duotone"></iconify-icon>登录</el-button>
     </el-form>
   </div>
 </div>
