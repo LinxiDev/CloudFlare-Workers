@@ -1,12 +1,20 @@
 // AccelPro.js - GitHub 和 Docker 加速代理服务器
-// 更新日期: 2026-06-12
+// 更新日期: 2026-07-09
 // 更新内容:
-// 1. 前端首页基于 Vue3、Element Plus、Tailwind CSS 和 HTML 重新美化，统一现代化工具页风格。
-// 2. 接入 Iconify 图标库，优化 GitHub 与 Docker 加速转换区域的图标、卡片和交互反馈。
-// 3. 使用用户 Logo 转换后的 PNG 路由作为 favicon 和页面品牌标识。
-// 4. 通过 s4.zstatic.net 加载 Vue、Element Plus、Tailwind CSS、Iconify，并保留深浅色主题切换。
-// 5. 保持原有 GitHub、Docker 代理与缓存逻辑不变，并补强重定向安全、请求体限制和 Docker Bearer 解析。
-// 6. 优化首页布局，并修复 docker.io/nginx 这类 Docker Hub 官方镜像路径解析。
+// 1. 无论是否重定向，只要目标是 AWS S3，就自动补全 x-amz-content-sha256 和 x-amz-date
+// 2. 改进Docker镜像路径处理逻辑，支持多种格式: 如 hello-world | library/hello-world | docker.io/library/hello-world
+// 3. 解决大陆拉取第三方 Docker 镜像层失败的问题，自动递归处理所有 302/307 跳转，无论跳转到哪个域名，都由 Worker 继续反代，避免客户端直接访问被墙 CDN，从而提升拉取成功率
+// 4. 感谢老王，处理了暗黑模式下，输入框的颜色显示问题
+// 5. 支持 Git smart-http 协议代理，解决 git clone 时 GitHub 返回 dumb-http 403 错误
+// 6. 支持 GitLab 系列域名（gitlab.com 等）的 git clone 加速
+// 7. 首页新增 Git Clone 加速功能模块，方便生成加速命令
+// 8. 前端基于 Vue3、Element Plus、Tailwind CSS 和 HTML 重新美化，统一现代化工具页风格
+// 9. 接入 Iconify 图标库，优化 GitHub 与 Docker 加速转换区域的图标、卡片和交互反馈
+// 10. 使用用户 Logo 转换后的 PNG 路由作为 favicon 和页面品牌标识
+// 11. 通过 s4.zstatic.net 加载 Vue、Element Plus、Tailwind CSS、Iconify，并保留深浅色主题切换
+// 12. 新增 Docker 令牌代理（/v2/ 挑战 + /v2/auth 端点），透传客户端凭据。用户执行
+//     `docker login <本域名>` 后即可用自己的 Docker Hub 账号拉取，规避匿名共享 IP 的速率限制
+//     （toomanyrequests: You have reached your unauthenticated pull rate limit）
 
 // ==========================================
 // 用户配置区域开始
@@ -26,7 +34,13 @@ const ALLOWED_HOSTS = [
   'api.github.com',
   'raw.githubusercontent.com',
   'gist.github.com',
-  'gist.githubusercontent.com'
+  'gist.githubusercontent.com',
+  'gitlab.com',
+  'gitlab.freedesktop.org',
+  'gitlab.gnome.org',
+  'gitlab.kitware.com',
+  'gitlab.archlinux.org',
+  'gitlab.postmarketos.org'
 ];
 
 // RESTRICT_PATHS: 控制是否限制 GitHub 和 Docker 请求的路径。
@@ -51,6 +65,21 @@ const DOCKER_HOSTS = [
   'docker.io'
 ];
 
+// GIT_HOSTS: 用于判断是否为 Git 托管平台的域名列表。
+const GIT_HOSTS = [
+  'github.com',
+  'api.github.com',
+  'raw.githubusercontent.com',
+  'gist.github.com',
+  'gist.githubusercontent.com',
+  'gitlab.com',
+  'gitlab.freedesktop.org',
+  'gitlab.gnome.org',
+  'gitlab.kitware.com',
+  'gitlab.archlinux.org',
+  'gitlab.postmarketos.org'
+];
+
 const GIT_SMART_SERVICES = ['git-upload-pack', 'git-receive-pack'];
 const MAX_REDIRECTS = 8;
 const MAX_PROXY_BODY_BYTES = 25 * 1024 * 1024;
@@ -68,18 +97,25 @@ const NPM_CDN_BASE_URL = 'https://s4.zstatic.net/npm';
 const MATERIAL_ICON_BASE_URL = 'https://npm.onmicrosoft.cn/material-icon-theme@5.27.0/icons/';
 
 function imageDataUrlResponse(dataUrl) {
+  if (!dataUrl || !dataUrl.includes(',')) {
+    return new Response('Logo not configured', { status: 404, headers: { 'Content-Type': 'text/plain' } });
+  }
   const [meta, base64] = dataUrl.split(',');
   const contentType = (meta.match(/^data:([^;]+)/) || [])[1] || 'application/octet-stream';
   const cleanBase64 = (base64 || '').replace(/\s/g, '');
-  const binary = atob(cleanBase64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return new Response(bytes, {
-    headers: {
-      'Content-Type': contentType,
-      'Cache-Control': 'public, max-age=31536000, immutable'
-    }
-  });
+  try {
+    const binary = atob(cleanBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Response(bytes, {
+      headers: {
+        'Content-Type': contentType,
+        'Cache-Control': 'public, max-age=31536000, immutable'
+      }
+    });
+  } catch {
+    return new Response('Logo binary error', { status: 500, headers: { 'Content-Type': 'text/plain' } });
+  }
 }
 
 const HOMEPAGE_HTML = `
@@ -93,6 +129,7 @@ const HOMEPAGE_HTML = `
   <link rel="preconnect" href="https://s4.zstatic.net">
   <link rel="preconnect" href="https://npm.onmicrosoft.cn">
   <link rel="stylesheet" href="${ASSET_CDN_BASE_URL}/element-plus/2.11.4/index.min.css">
+  <link rel="stylesheet" href="${ASSET_CDN_BASE_URL}/element-plus/2.11.4/dark/css-vars.css">
   <script src="${ASSET_CDN_BASE_URL}/tailwindcss-browser/4.1.13/index.global.min.js"></script>
   <script>
     window.tailwind = window.tailwind || {};
@@ -183,7 +220,8 @@ const HOMEPAGE_HTML = `
     .metric { border: 1px solid var(--border); border-radius: 8px; padding: 15px; background: var(--surface-strong); }
     .metric strong { display: block; font-size: 23px; line-height: 1.1; }
     .metric span { color: var(--muted); font-size: 12px; }
-    .side { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
+    .side { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: stretch; margin-top: 0; }
+    .side + .side { margin-top: 18px; }
     .tool-panel { padding: 22px; min-height: 276px; }
     .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
     .panel-title { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 800; }
@@ -201,6 +239,48 @@ const HOMEPAGE_HTML = `
     .status-item iconify-icon { color: var(--brand-strong); font-size: 20px; }
     .el-button iconify-icon { font-size: 18px; }
     .el-input__wrapper { border-radius: 8px; }
+    /* 暗黑模式输入框颜色修复 */
+    input[type="text"], .el-input__inner {
+      background-color: #ffffff !important;
+      color: #111827 !important;
+    }
+    .dark input[type="text"], .dark .el-input__inner {
+      background-color: #374151 !important;
+      color: #e5e7eb !important;
+    }
+    /* 暗黑模式 Element Plus 全局变量覆盖 */
+    .dark .el-input__wrapper {
+      background-color: #374151 !important;
+      box-shadow: 0 0 0 1px #4b5563 inset !important;
+    }
+    .dark .el-input__wrapper.is-focus {
+      box-shadow: 0 0 0 1px #60a5fa inset !important;
+    }
+    .dark .el-button {
+      --el-button-bg-color: #374151;
+      --el-button-border-color: #4b5563;
+      --el-button-text-color: #e5e7eb;
+    }
+    .dark .el-button--primary {
+      --el-button-bg-color: #2563eb;
+      --el-button-border-color: #2563eb;
+      --el-button-text-color: #ffffff;
+    }
+    .dark .el-button--success {
+      --el-button-bg-color: #059669;
+      --el-button-border-color: #059669;
+      --el-button-text-color: #ffffff;
+    }
+    .dark .el-message {
+      --el-message-bg-color: #1f2937;
+      --el-message-text-color: #e5e7eb;
+      --el-message-border-color: #4b5563;
+    }
+    .dark .el-tag {
+      --el-tag-bg-color: #374151;
+      --el-tag-border-color: #4b5563;
+      --el-tag-text-color: #9aa9bd;
+    }
     .footer { color: var(--muted); font-size: 13px; text-align: center; margin-top: 26px; }
     @media (max-width: 900px) {
       .page { padding: 18px; }
@@ -229,7 +309,7 @@ const HOMEPAGE_HTML = `
           <img class="brand-logo ring-1 ring-white/70 dark:ring-white/10" src="${APP_LOGO_SRC}" alt="AccelPro Logo">
           <div>
             <div class="brand-title">AccelPro</div>
-            <div class="brand-subtitle">GitHub 与 Docker 边缘代理加速</div>
+            <div class="brand-subtitle">GitHub · GitLab · Docker 边缘代理加速</div>
           </div>
         </div>
         <el-button circle @click="toggleTheme" :title="isDark ? '切换浅色主题' : '切换深色主题'">
@@ -244,8 +324,8 @@ const HOMEPAGE_HTML = `
               <iconify-icon icon="solar:bolt-bold-duotone"></iconify-icon>
               Cloudflare Workers 极速代理
             </div>
-            <h1>GitHub 文件和 Docker 镜像 CF加速。</h1>
-            <p class="lead">输入原始地址或镜像名，AccelPro 会生成当前 Worker 域名下的加速下载、Raw 文件访问和容器镜像拉取。</p>
+            <h1>GitHub 文件 / Git Clone 和 Docker 镜像 CF 加速。</h1>
+            <p class="lead">输入原始地址、.git 仓库或镜像名，AccelPro 会生成当前 Worker 域名下的加速下载、git clone 命令和容器镜像拉取。</p>
           </div>
           <div class="metrics grid gap-3">
             <div class="metric transition duration-200 hover:-translate-y-0.5 hover:border-sky-300 dark:hover:border-sky-500"><strong>2</strong><span>加速场景</span></div>
@@ -259,23 +339,23 @@ const HOMEPAGE_HTML = `
             <div class="panel-head">
               <div class="panel-title">
                 <span class="panel-icon"><iconify-icon icon="mdi:github"></iconify-icon></span>
-                GitHub 文件加速
+                GitHub 文件加速 / Git Clone
               </div>
-              <el-tag effect="plain">Release / Raw</el-tag>
+              <el-tag effect="plain">Release / Raw / Clone</el-tag>
             </div>
-            <p class="hint">粘贴 GitHub、raw.githubusercontent.com 或 gist 链接，生成可复制的 Worker 代理地址。</p>
-            <el-input v-model="githubInput" size="large" clearable placeholder="https://github.com/user/repo/releases/download/...">
+            <p class="hint">粘贴 GitHub / GitLab 文件、raw、gist 链接生成加速地址；输入以 .git 结尾的仓库地址则自动生成 git clone 加速命令。</p>
+            <el-input v-model="githubInput" size="large" clearable placeholder="https://github.com/user/repo/releases/... 或 https://github.com/user/repo.git">
               <template #prefix><iconify-icon icon="solar:link-bold-duotone"></iconify-icon></template>
             </el-input>
             <el-button type="primary" size="large" style="width:100%; margin-top: 12px;" @click="convertGithubUrl">
               <iconify-icon icon="solar:wand-magic-bold-duotone"></iconify-icon>
-              生成加速链接
+              {{ githubIsGitMode ? '生成加速命令' : '生成加速链接' }}
             </el-button>
             <div v-if="githubResult" class="result">
               <code>{{ githubResult }}</code>
               <div class="result-actions">
                 <el-button size="small" @click="copyText(githubResult)"><iconify-icon icon="solar:copy-bold-duotone"></iconify-icon>复制</el-button>
-                <el-button size="small" type="primary" plain @click="openUrl(githubResult)"><iconify-icon icon="solar:external-link-bold-duotone"></iconify-icon>打开</el-button>
+                <el-button v-if="!githubIsGitMode" size="small" type="primary" plain @click="openUrl(githubResult)"><iconify-icon icon="solar:external-link-bold-duotone"></iconify-icon>打开</el-button>
               </div>
             </div>
           </div>
@@ -303,13 +383,15 @@ const HOMEPAGE_HTML = `
               </div>
             </div>
           </div>
+        </section>
 
-          <div class="status-panel transition-colors duration-300">
+        <section class="side">
+          <div class="status-panel transition-colors duration-300" style="grid-column: 1 / -1;">
             <div class="status-grid">
               <div class="status-item"><iconify-icon icon="solar:shield-check-bold-duotone"></iconify-icon><span>白名单域名代理</span></div>
               <div class="status-item"><iconify-icon icon="solar:cloud-bolt-bold-duotone"></iconify-icon><span>Cloudflare 边缘缓存</span></div>
               <div class="status-item"><iconify-icon icon="solar:key-minimalistic-bold-duotone"></iconify-icon><span>Docker Token 缓存</span></div>
-              <div class="status-item"><iconify-icon icon="solar:code-scan-bold-duotone"></iconify-icon><span>Git Smart HTTP 支持</span></div>
+              <div class="status-item"><iconify-icon icon="solar:code-scan-bold-duotone"></iconify-icon><span>Git Smart HTTP</span></div>
             </div>
           </div>
         </section>
@@ -329,7 +411,8 @@ const HOMEPAGE_HTML = `
           githubInput: '',
           dockerInput: '',
           githubResult: '',
-          dockerResult: ''
+          dockerResult: '',
+          githubIsGitMode: false
         };
       },
       watch: {
@@ -349,11 +432,21 @@ const HOMEPAGE_HTML = `
           const input = this.githubInput.trim();
           if (!input || !input.startsWith('https://')) {
             this.githubResult = '';
+            this.githubIsGitMode = false;
             this.$message.error('请输入有效的 https:// 链接');
             return;
           }
-          this.githubResult = window.location.origin + '/https://' + input.slice(8);
-          this.copyText(this.githubResult, '已生成并复制加速链接');
+          if (input.endsWith('.git')) {
+            this.githubIsGitMode = true;
+            const domainPath = input.slice(8);
+            const proxyUrl = window.location.origin + '/https://' + domainPath;
+            this.githubResult = 'git clone ' + proxyUrl;
+          } else {
+            this.githubIsGitMode = false;
+            this.githubResult = window.location.origin + '/https://' + input.slice(8);
+          }
+          const msg = this.githubIsGitMode ? '已生成并复制 git clone 命令' : '已生成并复制加速链接';
+          this.copyText(this.githubResult, msg);
         },
         convertDockerImage() {
           let input = this.dockerInput.trim();
@@ -399,8 +492,6 @@ const HOMEPAGE_HTML = `
 </html>
 `;
 
-// ================= 工具函数 =================
-
 function isAmazonS3(url) {
   try { return new URL(url).hostname.includes('amazonaws.com'); } catch { return false; }
 }
@@ -410,6 +501,8 @@ function buildAmzDate() {
 }
 
 function isDockerHost(hostname) { return DOCKER_HOSTS.includes(hostname); }
+
+function isGitHost(hostname) { return GIT_HOSTS.includes(hostname); }
 
 function hasRequestBody(method) { return !['GET', 'HEAD'].includes((method || 'GET').toUpperCase()); }
 
@@ -465,15 +558,19 @@ function shouldChangeMethodToGet(status, method) {
   return status === 303 || ((status === 301 || status === 302) && upperMethod === 'POST');
 }
 
-function isGitSmartHttpPath(pathname = '', search = '') {
-  const lowerPath = pathname.toLowerCase();
-  const lowerSearch = search.toLowerCase();
-  return (
-    lowerPath.endsWith('/info/refs') || lowerPath.endsWith('/git-upload-pack') ||
-    lowerPath.endsWith('/git-receive-pack') || lowerPath.includes('/info/lfs') ||
-    lowerPath.endsWith('/objects/info/packs') ||
-    GIT_SMART_SERVICES.some(service => lowerSearch.includes(`service=${service}`))
-  );
+function isGitSmartHttpRequest(request, targetDomain) {
+  const ua = (request.headers.get('User-Agent') || '').toLowerCase();
+  if (ua.includes('git/')) return true;
+
+  if (isGitHost(targetDomain)) {
+    const url = new URL(request.url);
+    const pathname = url.pathname.toLowerCase();
+    const search = url.search.toLowerCase();
+    if (pathname.includes('/info/refs') || pathname.includes('/git-upload-pack') || pathname.includes('/git-receive-pack')) return true;
+    if (pathname.includes('.git')) return true;
+    if (GIT_SMART_SERVICES.some(service => search.includes(`service=${service}`))) return true;
+  }
+  return false;
 }
 
 function normalizeGitHubPath(pathname = '') {
@@ -485,19 +582,20 @@ function normalizeGitHubPath(pathname = '') {
   return normalized;
 }
 
-function applyCommonProxyHeaders(headers, targetUrl, isGitRequest = false) {
+function applyCommonProxyHeaders(headers, targetUrl, isGitRequestFlag = false) {
   try { headers.set('Host', new URL(targetUrl).hostname); } catch {}
-  
-  ['cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'x-forwarded-proto', 
-   'x-forwarded-host', 'x-real-ip', 'x-amz-content-sha256', 'x-amz-date', 
+
+  ['cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'x-forwarded-proto',
+   'x-forwarded-host', 'x-real-ip', 'x-amz-content-sha256', 'x-amz-date',
    'x-amz-security-token', 'x-amz-user-agent'].forEach(h => headers.delete(h));
 
+  // 无论是否重定向，只要目标是 AWS S3，就自动补全 x-amz-content-sha256 和 x-amz-date
   if (isAmazonS3(targetUrl)) {
     headers.set('x-amz-content-sha256', EMPTY_BODY_SHA256);
     headers.set('x-amz-date', buildAmzDate());
   }
 
-  if (isGitRequest) {
+  if (isGitRequestFlag) {
     const ua = headers.get('user-agent') || '';
     if (!/\bgit\//i.test(ua)) headers.set('User-Agent', 'git/2.45.2');
     if (!headers.has('Git-Protocol')) headers.set('Git-Protocol', 'version=2');
@@ -510,34 +608,36 @@ function buildFetchInit(method, headers, bodyBuffer, redirectStatus = null) {
   return { method: nextMethod, headers, body: hasRequestBody(nextMethod) ? bodyBuffer : null, redirect: 'manual' };
 }
 
-// ================= 核心逻辑 =================
-
-async function handleToken(realm, service, scope, ctx) {
+async function handleToken(realm, service, scope, ctx, clientAuthorization = null) {
   const tokenRequestUrl = new URL(realm);
   if (service) tokenRequestUrl.searchParams.set('service', service);
   if (scope) tokenRequestUrl.searchParams.set('scope', scope);
   const tokenUrl = tokenRequestUrl.toString();
+  // 携带用户凭据的令牌不缓存（每个用户各自独立）
+  const cacheable = !clientAuthorization;
   const cacheKey = new Request(tokenUrl, { method: 'GET' });
   const cache = caches.default;
-  
-  // 尝试从缓存获取 Token
-  const cachedResponse = await cache.match(cacheKey);
-  if (cachedResponse) {
-    console.log('Token cache hit');
-    const data = await cachedResponse.json();
-    return data.token || data.access_token;
+
+  if (cacheable) {
+    const cachedResponse = await cache.match(cacheKey);
+    if (cachedResponse) {
+      console.log('Token cache hit');
+      const data = await cachedResponse.json();
+      return data.token || data.access_token;
+    }
   }
 
   try {
-    const tokenResponse = await fetch(tokenUrl, { method: 'GET', headers: { 'Accept': 'application/json' } });
+    const tokenReqHeaders = { 'Accept': 'application/json' };
+    if (clientAuthorization) tokenReqHeaders['Authorization'] = clientAuthorization;
+    const tokenResponse = await fetch(tokenUrl, { method: 'GET', headers: tokenReqHeaders });
     if (!tokenResponse.ok) return null;
-    
+
     const tokenData = await tokenResponse.json();
     const token = tokenData.token || tokenData.access_token;
     if (!token) return null;
 
-    // 缓存 Token 5 分钟
-    if (ctx && ctx.waitUntil) {
+    if (cacheable && ctx && ctx.waitUntil) {
       const tokenCacheResponse = new Response(JSON.stringify(tokenData), {
         headers: { 'Cache-Control': 'max-age=300', 'Content-Type': 'application/json' }
       });
@@ -548,6 +648,60 @@ async function handleToken(realm, service, scope, ctx) {
     console.log(`Error fetching token: ${error.message}`);
     return null;
   }
+}
+
+// 仅转发 Basic 凭据（用户名/密码）给上游令牌服务器；Bearer 令牌属于镜像仓库不应转发
+function extractBasicAuthorization(request) {
+  const auth = request.headers.get('Authorization') || '';
+  return /^basic\s+/i.test(auth) ? auth : null;
+}
+
+// Docker Hub 官方镜像 scope 修正：repository:nginx:pull -> repository:library/nginx:pull
+function normalizeDockerHubScope(scope) {
+  if (!scope) return scope;
+  const parts = scope.split(':');
+  if (parts.length === 3 && parts[0] === 'repository' && !parts[1].includes('/')) {
+    parts[1] = 'library/' + parts[1];
+    return parts.join(':');
+  }
+  return scope;
+}
+
+// 向客户端发起 Docker 认证挑战，令其通过本 Worker 的 /v2/auth 端点获取令牌
+function dockerAuthChallengeResponse(url) {
+  return new Response('{}', {
+    status: 401,
+    headers: {
+      'Content-Type': 'application/json',
+      'Docker-Distribution-API-Version': 'registry/2.0',
+      'WWW-Authenticate': `Bearer realm="${url.protocol}//${url.host}/v2/auth",service="cloudflare-docker-proxy"`
+    }
+  });
+}
+
+// Docker 令牌代理：把客户端凭据（若有）转发给上游认证服务器
+async function handleDockerAuth(request, url) {
+  const pingResp = await fetch('https://registry-1.docker.io/v2/', { headers: { 'Accept': 'application/json' } });
+  if (pingResp.status !== 401) {
+    return new Response(pingResp.body, { status: pingResp.status, headers: { 'Content-Type': 'application/json' } });
+  }
+  const authParams = parseBearerChallenge(pingResp.headers.get('WWW-Authenticate'));
+  if (!authParams) return new Response('Unauthorized\n', { status: 401 });
+
+  const service = authParams.service || 'registry.docker.io';
+  const scope = normalizeDockerHubScope(url.searchParams.get('scope') || '');
+
+  const tokenUrl = new URL(authParams.realm);
+  tokenUrl.searchParams.set('service', service);
+  if (scope) tokenUrl.searchParams.set('scope', scope);
+
+  const tokenHeaders = new Headers({ 'Accept': 'application/json' });
+  const clientBasic = extractBasicAuthorization(request);
+  if (clientBasic) tokenHeaders.set('Authorization', clientBasic);
+
+  const tokenResp = await fetch(tokenUrl.toString(), { headers: tokenHeaders });
+  const respHeaders = new Headers({ 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  return new Response(tokenResp.body, { status: tokenResp.status, headers: respHeaders });
 }
 
 async function handleRequest(request, env, ctx) {
@@ -584,6 +738,26 @@ async function handleRequest(request, env, ctx) {
     return new Response(HOMEPAGE_HTML, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
+  // Docker /v2/auth 令牌代理端点：将客户端凭据转发给上游认证服务器
+  if (path === '/v2/auth') {
+    return handleDockerAuth(request, url);
+  }
+
+  // Docker /v2/ 初始 ping
+  if (path === '/v2' || path === '/v2/') {
+    // 若客户端已携带令牌（docker login 验证环节），透传到上游实际验证，不再返回挑战
+    if (request.headers.get('Authorization')) {
+      const pingResp = await fetch('https://registry-1.docker.io/v2/', {
+        headers: applyCommonProxyHeaders(new Headers(request.headers), 'https://registry-1.docker.io/v2/', false)
+      });
+      const newResp = new Response(pingResp.body, pingResp);
+      newResp.headers.set('Docker-Distribution-API-Version', 'registry/2.0');
+      newResp.headers.set('Access-Control-Allow-Origin', '*');
+      return newResp;
+    }
+    return dockerAuthChallengeResponse(url);
+  }
+
   // 解析 V2 API
   let isV2Request = false, v2RequestType = null, v2RequestTag = null;
   if (path.startsWith('/v2/')) {
@@ -602,23 +776,21 @@ async function handleRequest(request, env, ctx) {
     return new Response('Invalid request: target domain or path required\n', { status: 400 });
   }
 
-  let targetDomain, targetPath, isDockerRequest = false, isGitRequest = false;
-  const fullPath = path.startsWith('/') ? path.substring(1) : path;
+  let targetDomain, targetPath, isDockerRequest = false, isGitRequestFlag = false;
+  const fullPath = (path.startsWith('/') ? path.substring(1) : path) + url.search;
 
-  // 重构的镜像/路径解析逻辑
+  // 路径解析逻辑
   if (fullPath.startsWith('https://') || fullPath.startsWith('http://')) {
     const urlObj = new URL(fullPath);
     targetDomain = urlObj.hostname;
     targetPath = urlObj.pathname.substring(1) + (urlObj.search || url.search);
     isDockerRequest = isDockerHost(targetDomain);
     if (targetDomain === 'docker.io') targetDomain = 'registry-1.docker.io';
-    if (targetDomain === 'github.com') {
-      isGitRequest = isGitSmartHttpPath(urlObj.pathname, urlObj.search) || targetPath.endsWith('.git');
-    }
+    isGitRequestFlag = isGitSmartHttpRequest(request, targetDomain);
   } else {
     const firstPart = pathParts[0];
     if (firstPart === 'gh') {
-      isGitRequest = true;
+      isGitRequestFlag = true;
       targetDomain = 'github.com';
       targetPath = normalizeGitHubPath(pathParts.slice(1).join('/')) + url.search;
     } else if (firstPart === 'docker.io' || firstPart === 'registry-1.docker.io') {
@@ -629,11 +801,9 @@ async function handleRequest(request, env, ctx) {
       targetDomain = firstPart;
       targetPath = pathParts.slice(1).join('/') + url.search;
       isDockerRequest = isDockerHost(targetDomain);
-      if (targetDomain === 'github.com') {
-        isGitRequest = isGitSmartHttpPath(pathParts.slice(1).join('/'), url.search) || targetPath.endsWith('.git');
-      }
+      isGitRequestFlag = isGitSmartHttpRequest(request, targetDomain);
     } else {
-      // 默认视为 Docker Hub 镜像
+      // 默认视为 Docker Hub 镜像（支持 hello-world | library/hello-world | amilys/embyserver 等格式）
       isDockerRequest = true;
       targetDomain = 'registry-1.docker.io';
       targetPath = pathParts.length === 1 ? `library/${pathParts[0]}` : pathParts.join('/');
@@ -661,21 +831,23 @@ async function handleRequest(request, env, ctx) {
     targetUrl = `https://${targetDomain}/${isV2Request ? 'v2/' : ''}${targetPath}`;
   }
 
-  const newRequestHeaders = applyCommonProxyHeaders(new Headers(request.headers), targetUrl, isGitRequest);
+    const newRequestHeaders = applyCommonProxyHeaders(new Headers(request.headers), targetUrl, isGitRequestFlag);
 
-  try {
-    let activeRequestHeaders = newRequestHeaders;
-    let response = await fetch(targetUrl, buildFetchInit(method, activeRequestHeaders, requestBodyBuffer));
+    try {
+      let activeRequestHeaders = newRequestHeaders;
+      let response = await fetch(targetUrl, buildFetchInit(method, activeRequestHeaders, requestBodyBuffer));
 
-    // Docker 认证
+    // Docker 认证挑战处理
     if (isDockerRequest && response.status === 401) {
       const wwwAuth = response.headers.get('WWW-Authenticate');
       if (wwwAuth) {
         const authParams = parseBearerChallenge(wwwAuth);
         if (authParams) {
-          const token = await handleToken(authParams.realm, authParams.service || targetDomain, authParams.scope || '', ctx);
+          // 优先携带客户端 Basic 凭据（若用户已 docker login），否则匿名获取令牌
+          const clientBasic = extractBasicAuthorization(request);
+          const token = await handleToken(authParams.realm, authParams.service || targetDomain, authParams.scope || '', ctx, clientBasic);
           if (token) {
-            const authHeaders = applyCommonProxyHeaders(new Headers(request.headers), targetUrl, isGitRequest);
+            const authHeaders = applyCommonProxyHeaders(new Headers(request.headers), targetUrl, isGitRequestFlag);
             authHeaders.set('Authorization', `Bearer ${token}`);
             activeRequestHeaders = authHeaders;
             response = await fetch(targetUrl, buildFetchInit(method, authHeaders, requestBodyBuffer));
@@ -684,7 +856,7 @@ async function handleRequest(request, env, ctx) {
       }
     }
 
-    // 递归处理重定向
+    // 递归处理重定向（解决大陆拉取第三方 Docker 镜像层失败的问题）
     let redirects = 0;
     while ([301, 302, 303, 307, 308].includes(response.status) && redirects < MAX_REDIRECTS) {
       const redirectUrl = response.headers.get('Location');
@@ -697,13 +869,13 @@ async function handleRequest(request, env, ctx) {
         return new Response(`Unsafe redirect blocked: ${resolvedRedirectUrl}\n`, { status: 502 });
       }
 
-      const followHeaders = applyCommonProxyHeaders(new Headers(activeRequestHeaders), resolvedRedirectUrl, isGitRequest);
+      const followHeaders = applyCommonProxyHeaders(new Headers(activeRequestHeaders), resolvedRedirectUrl, isGitRequestFlag);
       stripCrossOriginSensitiveHeaders(followHeaders, targetUrl, resolvedRedirectUrl);
 
       response = await fetch(resolvedRedirectUrl, buildFetchInit(method, followHeaders, requestBodyBuffer, response.status));
       activeRequestHeaders = followHeaders;
       targetUrl = resolvedRedirectUrl;
-      
+
       if (response.status >= 400) return new Response(response.body, response);
     }
 
@@ -712,16 +884,15 @@ async function handleRequest(request, env, ctx) {
     newResponse.headers.set('Access-Control-Allow-Origin', '*');
     newResponse.headers.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
     newResponse.headers.set('Access-Control-Allow-Headers', '*');
-    
+
     if (isDockerRequest) {
       newResponse.headers.set('Docker-Distribution-API-Version', 'registry/2.0');
       newResponse.headers.delete('Location');
     }
-    
-    if (isGitRequest) {
+
+    if (isGitRequestFlag) {
       newResponse.headers.set('Cache-Control', 'no-store');
     } else if (response.status === 200) {
-      // 对静态资源添加缓存
       newResponse.headers.set('Cache-Control', 'public, max-age=14400');
     }
 
